@@ -1,87 +1,44 @@
-import time
+import logging
 import random
-from urllib.parse import urlparse
-from collections import defaultdict
-import aiohttp
-import asyncio
+import time
+from typing import List
+
+from .network import CrawlerNetwork
+from .worker import CrawlerWorker
+
+logger = logging.getLogger(__name__)
 
 class CrawlerNode:
-    def __init__(self, node_id, max_requests_per_domain=10):
-        self.node_id = node_id
-        self.max_requests_per_domain = max_requests_per_domain
-        self.domain_requests = defaultdict(int)
-        self.domain_timestamps = defaultdict(list)
-        self.backoff_times = defaultdict(lambda: 1)
+    def __init__(self, network: CrawlerNetwork, worker_count: int = 4):
+        self.network = network
+        self.workers: List[CrawlerWorker] = [CrawlerWorker(self.network) for _ in range(worker_count)]
+        self.active_workers = set(self.workers)
+        self.pending_tasks = []
+        self.task_queue = []
 
-    async def fetch_url(self, url, session):
-        domain = urlparse(url).netloc
-        
-        # Check domain request limits
-        if self.domain_requests[domain] >= self.max_requests_per_domain:
-            await self._wait_for_slot(domain)
-        
-        # Apply exponential backoff if needed
-        if self.backoff_times[domain] > 1:
-            await asyncio.sleep(self.backoff_times[domain])
-        
-        try:
-            async with session.get(url) as response:
-                if response.status == 429:  # Too Many Requests
-                    self.backoff_times[domain] = min(self.backoff_times[domain] * 2, 60)
-                    return None
-                    
-                self.backoff_times[domain] = max(1, self.backoff_times[domain] / 2)
-                content = await response.text()
-                
-                # Update rate limiting trackers
-                now = time.time()
-                self.domain_timestamps[domain].append(now)
-                self.domain_requests[domain] += 1
-                
-                return {
-                    'url': url,
-                    'status': response.status,
-                    'content': content,
-                    'headers': dict(response.headers)
-                }
-                
-        except Exception as e:
-            print(f'Error fetching {url}: {str(e)}')
-            self.backoff_times[domain] = min(self.backoff_times[domain] * 2, 60)
-            return None
+    def add_task(self, task):
+        self.pending_tasks.append(task)
 
-    async def _wait_for_slot(self, domain):
-        """Wait until a request slot becomes available for the domain"""
-        now = time.time()
+    def run(self):
         while True:
-            # Remove timestamps older than 60 seconds
-            self.domain_timestamps[domain] = [
-                ts for ts in self.domain_timestamps[domain]
-                if now - ts <= 60
-            ]
-            
-            if len(self.domain_timestamps[domain]) < self.max_requests_per_domain:
-                self.domain_requests[domain] = len(self.domain_timestamps[domain])
-                break
-                
-            await asyncio.sleep(random.uniform(0.1, 1.0))
+            # Load balance tasks across available workers
+            while self.pending_tasks and self.active_workers:
+                task = self.pending_tasks.pop(0)
+                worker = random.choice(list(self.active_workers))
+                worker.execute_task(task)
 
-    async def crawl_urls(self, urls):
-        """Crawl multiple URLs with rate limiting and backoff"""
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for url in urls:
-                task = asyncio.create_task(self.fetch_url(url, session))
-                tasks.append(task)
-                
-            results = await asyncio.gather(*tasks)
-            return [r for r in results if r is not None]
+            # Check worker status and handle failures
+            for worker in list(self.active_workers):
+                if not worker.is_alive():
+                    self.active_workers.remove(worker)
+                    logger.warning(f'Worker {worker} has failed. Launching replacement.')
+                    new_worker = CrawlerWorker(self.network)
+                    self.workers.append(new_worker)
+                    self.active_workers.add(new_worker)
 
-    def get_stats(self):
-        """Return current crawler stats"""
-        return {
-            'node_id': self.node_id,
-            'active_domains': len(self.domain_requests),
-            'total_requests': sum(self.domain_requests.values()),
-            'backoff_domains': len([d for d, t in self.backoff_times.items() if t > 1])
-        }
+            # Add new tasks to the queue
+            self.task_queue.extend(self.pending_tasks)
+            self.pending_tasks.clear()
+
+            # Sleep for a short time to avoid busy waiting
+            time.sleep(0.1)
