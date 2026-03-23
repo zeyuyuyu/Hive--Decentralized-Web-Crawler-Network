@@ -1,84 +1,87 @@
-import zmq
-import json
 import time
-from typing import Dict, List
-from dataclasses import dataclass
-
-@dataclass
-class CrawlTask:
-    url: str
-    depth: int
-    timestamp: float
-    parent_url: str = ''
+import random
+from urllib.parse import urlparse
+from collections import defaultdict
+import aiohttp
+import asyncio
 
 class CrawlerNode:
-    def __init__(self, node_id: str, coordinator_address: str = 'tcp://localhost:5555'):
+    def __init__(self, node_id, max_requests_per_domain=10):
         self.node_id = node_id
-        self.context = zmq.Context()
-        self.task_socket = self.context.socket(zmq.DEALER)
-        self.task_socket.setsockopt_string(zmq.IDENTITY, node_id)
-        self.task_socket.connect(coordinator_address)
-        
-        self.active_tasks: Dict[str, CrawlTask] = {}
-        self.results_cache: List[Dict] = []
-        
-    def request_task(self) -> None:
-        """Request a new crawl task from the coordinator"""
-        message = {'type': 'request_task', 'node_id': self.node_id}
-        self.task_socket.send_json(message)
+        self.max_requests_per_domain = max_requests_per_domain
+        self.domain_requests = defaultdict(int)
+        self.domain_timestamps = defaultdict(list)
+        self.backoff_times = defaultdict(lambda: 1)
 
-    def submit_result(self, task: CrawlTask, extracted_urls: List[str], content_hash: str) -> None:
-        """Submit crawl results back to coordinator"""
-        result = {
-            'type': 'submit_result',
-            'node_id': self.node_id,
-            'task_url': task.url,
-            'extracted_urls': extracted_urls,
-            'content_hash': content_hash,
-            'timestamp': time.time()
-        }
-        self.task_socket.send_json(result)
-
-    def handle_assigned_task(self, task_data: Dict) -> None:
-        """Process a newly assigned crawl task"""
-        task = CrawlTask(
-            url=task_data['url'],
-            depth=task_data['depth'],
-            timestamp=time.time(),
-            parent_url=task_data.get('parent_url', '')
-        )
-        self.active_tasks[task.url] = task
-        # Crawling logic would go here
-        # For now just simulate some work
-        time.sleep(1)
-        self.submit_result(task, ['http://example.com/1', 'http://example.com/2'], 'fake_hash')
-
-    def run(self) -> None:
-        """Main event loop for the crawler node"""
-        self.request_task()
+    async def fetch_url(self, url, session):
+        domain = urlparse(url).netloc
         
+        # Check domain request limits
+        if self.domain_requests[domain] >= self.max_requests_per_domain:
+            await self._wait_for_slot(domain)
+        
+        # Apply exponential backoff if needed
+        if self.backoff_times[domain] > 1:
+            await asyncio.sleep(self.backoff_times[domain])
+        
+        try:
+            async with session.get(url) as response:
+                if response.status == 429:  # Too Many Requests
+                    self.backoff_times[domain] = min(self.backoff_times[domain] * 2, 60)
+                    return None
+                    
+                self.backoff_times[domain] = max(1, self.backoff_times[domain] / 2)
+                content = await response.text()
+                
+                # Update rate limiting trackers
+                now = time.time()
+                self.domain_timestamps[domain].append(now)
+                self.domain_requests[domain] += 1
+                
+                return {
+                    'url': url,
+                    'status': response.status,
+                    'content': content,
+                    'headers': dict(response.headers)
+                }
+                
+        except Exception as e:
+            print(f'Error fetching {url}: {str(e)}')
+            self.backoff_times[domain] = min(self.backoff_times[domain] * 2, 60)
+            return None
+
+    async def _wait_for_slot(self, domain):
+        """Wait until a request slot becomes available for the domain"""
+        now = time.time()
         while True:
-            try:
-                message = self.task_socket.recv_json(flags=zmq.NOBLOCK)
-                if message['type'] == 'assign_task':
-                    self.handle_assigned_task(message['task'])
-                    self.request_task()  # Request another task when done
-            except zmq.Again:
-                # No message available
-                time.sleep(0.1)
-            except Exception as e:
-                print(f'Error in crawler node {self.node_id}: {str(e)}')
-                time.sleep(1)
+            # Remove timestamps older than 60 seconds
+            self.domain_timestamps[domain] = [
+                ts for ts in self.domain_timestamps[domain]
+                if now - ts <= 60
+            ]
+            
+            if len(self.domain_timestamps[domain]) < self.max_requests_per_domain:
+                self.domain_requests[domain] = len(self.domain_timestamps[domain])
+                break
+                
+            await asyncio.sleep(random.uniform(0.1, 1.0))
 
-    def shutdown(self) -> None:
-        """Clean shutdown of the crawler node"""
-        self.task_socket.close()
-        self.context.term()
+    async def crawl_urls(self, urls):
+        """Crawl multiple URLs with rate limiting and backoff"""
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for url in urls:
+                task = asyncio.create_task(self.fetch_url(url, session))
+                tasks.append(task)
+                
+            results = await asyncio.gather(*tasks)
+            return [r for r in results if r is not None]
 
-if __name__ == '__main__':
-    import uuid
-    node = CrawlerNode(str(uuid.uuid4()))
-    try:
-        node.run()
-    except KeyboardInterrupt:
-        node.shutdown()
+    def get_stats(self):
+        """Return current crawler stats"""
+        return {
+            'node_id': self.node_id,
+            'active_domains': len(self.domain_requests),
+            'total_requests': sum(self.domain_requests.values()),
+            'backoff_domains': len([d for d, t in self.backoff_times.items() if t > 1])
+        }
