@@ -1,64 +1,60 @@
-import time
+import asyncio
 import random
-import hashlib
-import json
-from typing import List, Tuple
+import time
+from typing import List
+
+from .message_protocol import Message, MessageType
+from .peer_discovery import PeerDiscovery
+from .storage import StorageManager
 
 class CrawlerNode:
-    def __init__(self, node_id: str, peers: List[str]):
-        self.node_id = node_id
-        self.peers = peers
-        self.blockchain = []
-        self.pending_transactions = []
-        self.mine_rate = 10  # blocks per minute
+    def __init__(self, storage_manager: StorageManager, peer_discovery: PeerDiscovery):
+        self.storage_manager = storage_manager
+        self.peer_discovery = peer_discovery
+        self.consensus_peers: List[str] = []
+        self.consensus_state = {}
+        self.consensus_lock = asyncio.Lock()
 
-    def broadcast_transaction(self, transaction: dict):
-        self.pending_transactions.append(transaction)
-        for peer in self.peers:
-            # Broadcast transaction to all peers
-            pass
+    async def start(self):
+        await self.peer_discovery.start()
+        self.consensus_peers = await self.peer_discovery.discover_peers()
+        self.consensus_state = await self.fetch_consensus_state()
+        self.run_consensus_loop()
 
-    def mine_block(self):
-        if not self.pending_transactions:
-            return
+    async def fetch_consensus_state(self) -> dict:
+        consensus_state = {}
+        for peer in self.consensus_peers:
+            try:
+                message = Message(MessageType.GET_CONSENSUS_STATE, {})
+                response = await self.send_message_to_peer(peer, message)
+                consensus_state.update(response.data)
+            except Exception as e:
+                print(f'Error fetching consensus state from peer {peer}: {e}')
+        return consensus_state
 
-        # Create a new block
-        block = {
-            'index': len(self.blockchain) + 1,
-            'timestamp': time.time(),
-            'transactions': self.pending_transactions,
-            'proof': self.proof_of_work(),
-            'previous_hash': self.blockchain[-1]['hash'] if self.blockchain else None
-        }
+    async def send_message_to_peer(self, peer: str, message: Message) -> Message:
+        reader, writer = await asyncio.open_connection(peer.split(':')[0], int(peer.split(':')[1]))
+        writer.write(message.serialize())
+        await writer.drain()
+        response = await Message.deserialize_from_reader(reader)
+        writer.close()
+        await writer.wait_closed()
+        return response
 
-        # Add the block to the blockchain
-        self.blockchain.append(block)
-        self.pending_transactions = []
+    def run_consensus_loop(self):
+        async def consensus_loop():
+            while True:
+                async with self.consensus_lock:
+                    new_state = await self.fetch_consensus_state()
+                    if new_state != self.consensus_state:
+                        self.consensus_state = new_state
+                        await self.storage_manager.update_storage(new_state)
+                    await asyncio.sleep(random.uniform(10, 30))
+        asyncio.create_task(consensus_loop())
 
-        # Broadcast the new block to all peers
-        for peer in self.peers:
-            # Broadcast block to all peers
-            pass
-
-    def proof_of_work(self) -> int:
-        proof = 0
-        while self.valid_proof(proof) is False:
-            proof += 1
-        return proof
-
-    def valid_proof(self, proof: int) -> bool:
-        block_string = json.dumps(self.pending_transactions, sort_keys=True).encode()
-        guess = hashlib.sha256(block_string).hexdigest()
-        return guess[:4] == '0000'
-
-    def reach_consensus(self) -> Tuple[bool, List[dict]]:
-        # Implement distributed consensus protocol
-        pass
-
-class ConsensusProtocol:
-    def __init__(self, crawler_nodes: List[CrawlerNode]):
-        self.crawler_nodes = crawler_nodes
-
-    def reach_consensus(self) -> Tuple[bool, List[dict]]:
-        # Implement distributed consensus protocol
-        pass
+    async def handle_message(self, message: Message) -> Message:
+        if message.type == MessageType.GET_CONSENSUS_STATE:
+            async with self.consensus_lock:
+                return Message(MessageType.CONSENSUS_STATE, self.consensus_state)
+        else:
+            raise ValueError(f'Unknown message type: {message.type}')
