@@ -1,60 +1,55 @@
-import asyncio
+import hashlib
 import random
 import time
+import requests
 from typing import List
 
-from .message_protocol import Message, MessageType
-from .peer_discovery import PeerDiscovery
-from .storage import StorageManager
-
 class CrawlerNode:
-    def __init__(self, storage_manager: StorageManager, peer_discovery: PeerDiscovery):
-        self.storage_manager = storage_manager
-        self.peer_discovery = peer_discovery
-        self.consensus_peers: List[str] = []
-        self.consensus_state = {}
-        self.consensus_lock = asyncio.Lock()
+    def __init__(self, node_id: str, peers: List[str]):
+        self.node_id = node_id
+        self.peers = peers
+        self.load_factor = 0
+        self.queue = []
 
-    async def start(self):
-        await self.peer_discovery.start()
-        self.consensus_peers = await self.peer_discovery.discover_peers()
-        self.consensus_state = await self.fetch_consensus_state()
-        self.run_consensus_loop()
+    def add_to_queue(self, url: str):
+        self.queue.append(url)
 
-    async def fetch_consensus_state(self) -> dict:
-        consensus_state = {}
-        for peer in self.consensus_peers:
+    def process_queue(self):
+        while self.queue:
+            url = self.queue.pop(0)
             try:
-                message = Message(MessageType.GET_CONSENSUS_STATE, {})
-                response = await self.send_message_to_peer(peer, message)
-                consensus_state.update(response.data)
+                response = requests.get(url)
+                self.process_response(response)
             except Exception as e:
-                print(f'Error fetching consensus state from peer {peer}: {e}')
-        return consensus_state
+                print(f'Error processing {url}: {e}')
+            self.load_factor += 1
+            time.sleep(random.uniform(0.1, 1.0))
 
-    async def send_message_to_peer(self, peer: str, message: Message) -> Message:
-        reader, writer = await asyncio.open_connection(peer.split(':')[0], int(peer.split(':')[1]))
-        writer.write(message.serialize())
-        await writer.drain()
-        response = await Message.deserialize_from_reader(reader)
-        writer.close()
-        await writer.wait_closed()
-        return response
+    def process_response(self, response):
+        # Process the response and extract new URLs
+        new_urls = self.extract_urls(response.text)
+        # Distribute the new URLs to other nodes
+        self.distribute_urls(new_urls)
 
-    def run_consensus_loop(self):
-        async def consensus_loop():
-            while True:
-                async with self.consensus_lock:
-                    new_state = await self.fetch_consensus_state()
-                    if new_state != self.consensus_state:
-                        self.consensus_state = new_state
-                        await self.storage_manager.update_storage(new_state)
-                    await asyncio.sleep(random.uniform(10, 30))
-        asyncio.create_task(consensus_loop())
+    def extract_urls(self, html: str) -> List[str]:
+        # Implement URL extraction logic here
+        return []
 
-    async def handle_message(self, message: Message) -> Message:
-        if message.type == MessageType.GET_CONSENSUS_STATE:
-            async with self.consensus_lock:
-                return Message(MessageType.CONSENSUS_STATE, self.consensus_state)
-        else:
-            raise ValueError(f'Unknown message type: {message.type}')
+    def distribute_urls(self, urls: List[str]):
+        for url in urls:
+            # Hash the URL to determine the target node
+            target_node = self.get_target_node(url)
+            if target_node == self.node_id:
+                self.add_to_queue(url)
+            else:
+                # Send the URL to the target node
+                self.send_to_peer(target_node, url)
+
+    def get_target_node(self, url: str) -> str:
+        # Hash the URL to determine the target node
+        hash_value = hashlib.sha256(url.encode()).hexdigest()
+        return self.peers[int(hash_value, 16) % len(self.peers)]
+
+    def send_to_peer(self, peer_id: str, url: str):
+        # Implement logic to send the URL to the target peer node
+        pass
